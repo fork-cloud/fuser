@@ -202,7 +202,6 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
 /// yet destroyed by the kernel.
 #[cfg(any(all(not(target_os = "macos"), test), fuser_mount_impl = "pure-rust"))]
 fn is_mounted(device: &impl std::os::fd::AsFd) -> bool {
-    use std::os::unix::io::AsFd;
     use std::slice;
 
     use nix::poll::PollFd;
