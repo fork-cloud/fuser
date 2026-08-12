@@ -1,5 +1,6 @@
 use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -61,6 +62,7 @@ impl BackingId {
         Ok(id as u32)
     }
 
+    #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
     pub(crate) fn create(channel: &Arc<DevFuse>, fd: impl AsFd) -> std::io::Result<Self> {
         Ok(Self {
             channel: Arc::downgrade(channel),
@@ -68,6 +70,7 @@ impl BackingId {
         })
     }
 
+    #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
     pub(crate) unsafe fn wrap_raw(channel: &Arc<DevFuse>, id: u32) -> Self {
         Self {
             channel: Arc::downgrade(channel),

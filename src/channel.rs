@@ -1,34 +1,60 @@
 use std::io;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::sync::Arc;
 
 use nix::errno::Errno;
 
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use crate::dev_fuse::DevFuse;
 use crate::passthrough::BackingId;
 
-/// A raw communication channel to the FUSE kernel driver
-#[derive(Debug, Clone)]
-pub(crate) struct Channel(Arc<DevFuse>);
+#[cfg(any(test, all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+pub(crate) mod darwin;
 
+/// A raw FUSE request and reply channel.
+#[derive(Debug, Clone)]
+pub(crate) struct Channel(ChannelInner);
+
+#[derive(Debug, Clone)]
+enum ChannelInner {
+    #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+    Device(Arc<DevFuse>),
+    #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+    Darwin(darwin::MountedChannel),
+}
+
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 impl AsFd for Channel {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        match &self.0 {
+            #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+            ChannelInner::Device(device) => device.as_fd(),
+        }
     }
 }
 
 impl Channel {
-    /// Create a new communication channel to the kernel driver by mounting the
-    /// given path. The kernel driver will delegate filesystem operations of
-    /// the given path to the channel.
-    pub(crate) fn new(device: Arc<DevFuse>) -> Self {
-        Self(device)
+    #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+    pub(crate) fn from_device(device: Arc<DevFuse>) -> Self {
+        Self(ChannelInner::Device(device))
+    }
+
+    #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+    pub(crate) fn from_darwin(channel: darwin::MountedChannel) -> Self {
+        Self(ChannelInner::Darwin(channel))
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
     fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
-        nix::unistd::read(&self.0, buffer)
+        match &self.0 {
+            #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+            ChannelInner::Device(device) => nix::unistd::read(device, buffer),
+            #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+            ChannelInner::Darwin(channel) => channel.receive(buffer),
+        }
     }
 
     /// Receives data up to the capacity of the given buffer (can block),
@@ -51,9 +77,14 @@ impl Channel {
     /// used to send to the channel. Multiple sender objects can be used
     /// and they can safely be sent to other threads.
     pub(crate) fn sender(&self) -> ChannelSender {
-        // Since write/writev syscalls are threadsafe, we can simply create
-        // a sender by using the same file and use it in other threads.
-        ChannelSender(self.0.clone())
+        let inner = match &self.0 {
+            // Since write/writev syscalls are threadsafe, senders can share the file.
+            #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+            ChannelInner::Device(device) => ChannelSenderInner::Device(device.clone()),
+            #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+            ChannelInner::Darwin(channel) => ChannelSenderInner::Darwin(channel.sender()),
+        };
+        ChannelSender(inner)
     }
 
     /// Clone the FUSE device fd using FUSE_DEV_IOC_CLONE ioctl.
@@ -69,34 +100,67 @@ impl Channel {
 
         let new_dev = DevFuse::open()?;
 
-        let mut source_fd = self.0.as_raw_fd() as u32;
+        let ChannelInner::Device(device) = &self.0;
+        let mut source_fd = device.as_raw_fd() as u32;
         // SAFETY: fuse_dev_ioc_clone is a valid ioctl for /dev/fuse
         unsafe {
             crate::ll::ioctl::fuse_dev_ioc_clone(new_dev.as_raw_fd(), &mut source_fd)?;
         }
 
-        Ok(Channel::new(Arc::new(new_dev)))
+        Ok(Channel::from_device(Arc::new(new_dev)))
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelSender(Arc<DevFuse>);
+pub(crate) struct ChannelSender(ChannelSenderInner);
+
+#[derive(Clone, Debug)]
+enum ChannelSenderInner {
+    #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+    Device(Arc<DevFuse>),
+    #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+    Darwin(darwin::MountedSender),
+}
 
 impl ChannelSender {
     pub(crate) fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let rc = nix::sys::uio::writev(&self.0, bufs)?;
-        // writev is atomic, so do not need to check how many bytes are written.
-        // libfuse does not do it either
-        // https://github.com/libfuse/libfuse/blob/6278995cca991978abd25ebb2c20ebd3fc9e8a13/lib/fuse_lowlevel.c#L267
-        debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc);
-        Ok(())
+        match &self.0 {
+            #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+            ChannelSenderInner::Device(device) => {
+                let rc = nix::sys::uio::writev(device, bufs)?;
+                // writev is atomic, so do not need to check how many bytes are written.
+                debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+            ChannelSenderInner::Darwin(sender) => sender.send(bufs),
+        }
     }
 
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-        BackingId::create(&self.0, fd)
+        match &self.0 {
+            #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+            ChannelSenderInner::Device(device) => BackingId::create(device, fd),
+            #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+            ChannelSenderInner::Darwin(_) => {
+                let _ = fd;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "backing IDs are unavailable on macFUSE's FSKit channel",
+                ))
+            }
+        }
     }
 
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
-        unsafe { BackingId::wrap_raw(&self.0, id) }
+        match &self.0 {
+            #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
+            ChannelSenderInner::Device(device) => unsafe { BackingId::wrap_raw(device, id) },
+            #[cfg(all(target_os = "macos", fuser_mount_impl = "libfuse2"))]
+            ChannelSenderInner::Darwin(_) => {
+                let _ = id;
+                panic!("backing IDs are unavailable on macFUSE's FSKit channel")
+            }
+        }
     }
 }

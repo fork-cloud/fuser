@@ -1,11 +1,11 @@
-//! FUSE kernel driver communication
+//! FUSE request and reply communication
 //!
-//! Raw communication channel to the FUSE kernel driver.
+//! Raw communication channels exposed by mounted FUSE providers.
 
 #[cfg(fuser_mount_impl = "libfuse2")]
 mod fuse2;
 #[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
-mod fuse2_sys;
+pub(crate) mod fuse2_sys;
 #[cfg(fuser_mount_impl = "libfuse3")]
 mod fuse3;
 #[cfg(fuser_mount_impl = "libfuse3")]
@@ -23,12 +23,12 @@ use log::info;
 use log::warn;
 use mount_options::MountOption;
 
-use crate::dev_fuse::DevFuse;
+use crate::channel::Channel;
 
 /// Helper function to provide options as a `fuse_args` struct
 /// (which contains an argc count and an argv pointer)
 #[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
-fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(
+fn with_fuse_args<T, F: FnOnce(&mut fuse_args) -> T>(
     options: &[MountOption],
     acl: SessionACL,
     f: F,
@@ -49,17 +49,21 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(
         args.push(CString::new(acl).unwrap());
     }
     let argptrs: Vec<_> = args.iter().map(|s| s.as_ptr()).collect();
-    f(&fuse_args {
+    f(&mut fuse_args {
         argc: argptrs.len() as i32,
         argv: argptrs.as_ptr(),
         allocated: 0,
     })
 }
 
+#[cfg(any(
+    fuser_mount_impl = "pure-rust",
+    fuser_mount_impl = "libfuse3",
+    all(fuser_mount_impl = "libfuse2", not(target_os = "macos"))
+))]
 use std::ffi::CStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::SessionACL;
 
@@ -100,12 +104,12 @@ impl Mount {
         mountpoint: &Path,
         options: &[MountOption],
         acl: SessionACL,
-    ) -> io::Result<(Arc<DevFuse>, Mount)> {
+    ) -> io::Result<(Channel, Mount)> {
         #[cfg(fuser_mount_impl = "pure-rust")]
         {
             let (dev_fuse, mount) = fuse_pure::MountImpl::new(mountpoint, options, acl)?;
             Ok((
-                dev_fuse,
+                Channel::from_device(dev_fuse),
                 Mount {
                     mount_impl: Some(MountImpl::Pure(mount)),
                     mount_point: mountpoint.to_path_buf(),
@@ -114,9 +118,9 @@ impl Mount {
         }
         #[cfg(fuser_mount_impl = "libfuse2")]
         {
-            let (dev_fuse, mount) = fuse2::MountImpl::new(mountpoint, options, acl)?;
+            let (channel, mount) = fuse2::MountImpl::new(mountpoint, options, acl)?;
             Ok((
-                dev_fuse,
+                channel,
                 Mount {
                     mount_impl: Some(MountImpl::Fuse2(mount)),
                     mount_point: mountpoint.to_path_buf(),
@@ -127,7 +131,7 @@ impl Mount {
         {
             let (dev_fuse, mount) = fuse3::MountImpl::new(mountpoint, options, acl)?;
             Ok((
-                dev_fuse,
+                Channel::from_device(dev_fuse),
                 Mount {
                     mount_impl: Some(MountImpl::Fuse3(mount)),
                     mount_point: mountpoint.to_path_buf(),
@@ -165,7 +169,11 @@ impl Drop for Mount {
     }
 }
 
-#[cfg_attr(fuser_mount_impl = "macos-no-mount", expect(dead_code))]
+#[cfg(any(
+    fuser_mount_impl = "pure-rust",
+    fuser_mount_impl = "libfuse3",
+    all(fuser_mount_impl = "libfuse2", not(target_os = "macos"))
+))]
 fn libc_umount(mnt: &CStr) -> nix::Result<()> {
     #[cfg(any(
         target_os = "macos",
@@ -193,7 +201,7 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
 /// Warning: This will return true if the filesystem has been detached (lazy unmounted), but not
 /// yet destroyed by the kernel.
 #[cfg(any(all(not(target_os = "macos"), test), fuser_mount_impl = "pure-rust"))]
-fn is_mounted(fuse_device: &DevFuse) -> bool {
+fn is_mounted(channel: &Channel) -> bool {
     use std::os::unix::io::AsFd;
     use std::slice;
 
@@ -203,7 +211,7 @@ fn is_mounted(fuse_device: &DevFuse) -> bool {
     use nix::poll::poll;
 
     loop {
-        let mut poll_fd = PollFd::new(fuse_device.as_fd(), PollFlags::empty());
+        let mut poll_fd = PollFd::new(channel.as_fd(), PollFlags::empty());
         let res = poll(slice::from_mut(&mut poll_fd), PollTimeout::ZERO);
         break match res {
             Ok(0) => true,
@@ -276,11 +284,11 @@ mod test {
         // want to try and clean up the directory if it's a mountpoint otherwise we'll
         // deadlock.
         let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
-        let (file, mount) = Mount::new(tmp.path(), &[], SessionACL::default()).unwrap();
+        let (channel, mount) = Mount::new(tmp.path(), &[], SessionACL::default()).unwrap();
         let mnt = cmd_mount();
         eprintln!("Our mountpoint: {:?}\nfuse mounts:\n{}", tmp.path(), mnt,);
         assert!(mnt.contains(&*tmp.path().to_string_lossy()));
-        assert!(is_mounted(&file));
+        assert!(is_mounted(&channel));
         drop(mount);
         let mnt = cmd_mount();
         eprintln!("Our mountpoint: {:?}\nfuse mounts:\n{}", tmp.path(), mnt,);
@@ -298,6 +306,6 @@ mod test {
         }
 
         // Filesystem may have been lazy unmounted, so we can't assert this:
-        // assert!(!is_mounted(&file));
+        // assert!(!is_mounted(&channel));
     }
 }

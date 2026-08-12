@@ -1,5 +1,8 @@
 # FUSE for Rust - Changelog
 
+## Unreleased
+* Use libfuse2 message channels on macOS, including FSKit providers without a FUSE file descriptor
+
 ## 0.18.0 - 2026-07-22
 * Remove deprecated feature flags `abi-*`
 * Rename `mount2()` to `mount()`

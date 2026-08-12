@@ -6,10 +6,14 @@
 //! for filesystem operations under its mount point.
 
 use std::borrow::Cow;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::fs::File;
 use std::io;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::os::fd::AsFd;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::os::fd::BorrowedFd;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +36,7 @@ use crate::ReplyEmpty;
 use crate::Request;
 use crate::channel::Channel;
 use crate::channel::ChannelSender;
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 use crate::dev_fuse::DevFuse;
 use crate::ll;
 use crate::ll::Operation;
@@ -141,6 +146,7 @@ pub struct Session<FS: Filesystem> {
     pub(crate) config: Config,
 }
 
+#[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
 impl<FS: Filesystem> AsFd for Session<FS> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.ch.as_fd()
@@ -170,9 +176,7 @@ impl<FS: Filesystem> Session<FS> {
                 format!("auto_unmount requires acl != Owner, got: {:?}", options.acl),
             ));
         }
-        let (file, mount) = Mount::new(mountpoint, &options.mount_options, options.acl)?;
-
-        let ch = Channel::new(file);
+        let (ch, mount) = Mount::new(mountpoint, &options.mount_options, options.acl)?;
 
         let mut session = Session {
             filesystem: FilesystemHolder {
@@ -195,13 +199,14 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
+    #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
     pub fn from_fd(
         filesystem: FS,
         fd: OwnedFd,
         acl: SessionACL,
         config: Config,
     ) -> io::Result<Self> {
-        let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
+        let ch = Channel::from_device(Arc::new(DevFuse(File::from(fd))));
         let mut session = Session {
             filesystem: FilesystemHolder {
                 fs: Some(filesystem),
