@@ -6,16 +6,16 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Christopher Berner <me@cberner.com>"]
 license = "MIT"
-repository = "https://github.com/cberner/fuser"
+repository = "https://github.com/fork-cloud/fuser"
 
 [package]
 name = "fuser"
-description = "Filesystem in Userspace (FUSE) for Rust"
+description = "Fork-maintained fuser source dependency for native macOS FSKit"
 license.workspace = true
 repository.workspace = true
-documentation = "https://docs.rs/fuser"
-homepage = "https://github.com/cberner/fuser"
+homepage = "https://github.com/fork-cloud/fuser"
 version = "0.18.0"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 readme = "README.md"
