@@ -201,7 +201,7 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
 /// Warning: This will return true if the filesystem has been detached (lazy unmounted), but not
 /// yet destroyed by the kernel.
 #[cfg(any(all(not(target_os = "macos"), test), fuser_mount_impl = "pure-rust"))]
-fn is_mounted(channel: &Channel) -> bool {
+fn is_mounted(device: &impl std::os::fd::AsFd) -> bool {
     use std::os::unix::io::AsFd;
     use std::slice;
 
@@ -211,7 +211,7 @@ fn is_mounted(channel: &Channel) -> bool {
     use nix::poll::poll;
 
     loop {
-        let mut poll_fd = PollFd::new(channel.as_fd(), PollFlags::empty());
+        let mut poll_fd = PollFd::new(device.as_fd(), PollFlags::empty());
         let res = poll(slice::from_mut(&mut poll_fd), PollTimeout::ZERO);
         break match res {
             Ok(0) => true,
