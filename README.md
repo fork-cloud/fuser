@@ -37,8 +37,8 @@ as a source dependency. It is not published to crates.io.
   [upstream](https://github.com/cberner/fuser/issues). Fork-specific integration
   defects should be reported to [Fork](https://github.com/fork-cloud/fork/issues).
 
-The repository remains available as source so Fork builds can be reproducible
-and the dependency delta can be audited without credentials.
+The repository is intended to remain available as source so Fork builds can be
+reproducible and the dependency delta can be audited without credentials.
 
 ## License and attribution
 
