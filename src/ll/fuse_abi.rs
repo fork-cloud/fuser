@@ -509,11 +509,16 @@ pub(crate) struct fuse_init_in {
     pub(crate) minor: u32,
     pub(crate) max_readahead: u32,
     pub(crate) flags: u32,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) flags2: u32,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) unused: [u32; 11],
 }
 
+pub(crate) const FUSE_COMPAT_INIT_IN_SIZE: usize = 16;
+#[cfg(not(target_os = "macos"))]
 pub(crate) const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
+#[cfg(not(target_os = "macos"))]
 pub(crate) const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 
 #[repr(C)]
@@ -526,11 +531,17 @@ pub(crate) struct fuse_init_out {
     pub(crate) max_background: u16,
     pub(crate) congestion_threshold: u16,
     pub(crate) max_write: u32,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) time_gran: u32,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) max_pages: u16,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) unused2: u16,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) flags2: u32,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) max_stack_depth: u32,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) reserved: [u32; 6],
 }
 

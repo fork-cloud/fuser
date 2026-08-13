@@ -11,6 +11,7 @@
     unreachable_pub
 )]
 
+#[cfg(not(target_os = "macos"))]
 use std::cmp::max;
 use std::cmp::min;
 use std::convert::AsRef;
@@ -107,15 +108,17 @@ mod time;
 const INIT_FLAGS: InitFlags = InitFlags::FUSE_ASYNC_READ.union(InitFlags::FUSE_BIG_WRITES);
 // TODO: Add FUSE_EXPORT_SUPPORT
 
-/// On macOS, we additionally support case insensitiveness, volume renames and xtimes
-/// TODO: we should eventually let the filesystem implementation decide which flags to set
+/// macOS capabilities with semantic consequences are opt-in.
 #[cfg(target_os = "macos")]
-const INIT_FLAGS: InitFlags = InitFlags::FUSE_ASYNC_READ
-    .union(InitFlags::FUSE_CASE_INSENSITIVE)
-    .union(InitFlags::FUSE_VOL_RENAME)
-    .union(InitFlags::FUSE_XTIMES);
+const INIT_FLAGS: InitFlags = InitFlags::FUSE_ASYNC_READ;
 // TODO: Add FUSE_EXPORT_SUPPORT and FUSE_BIG_WRITES (requires ABI 7.10)
 
+#[cfg(target_os = "macos")]
+fn default_init_flags(_capabilities: InitFlags) -> InitFlags {
+    INIT_FLAGS
+}
+
+#[cfg(not(target_os = "macos"))]
 fn default_init_flags(capabilities: InitFlags) -> InitFlags {
     let mut flags = INIT_FLAGS;
     if capabilities.contains(InitFlags::FUSE_MAX_PAGES) {
@@ -326,6 +329,13 @@ impl KernelConfig {
     }
 
     /// Query kernel capabilities.
+    #[cfg(target_os = "macos")]
+    pub fn capabilities(&self) -> InitFlags {
+        self.capabilities
+    }
+
+    /// Query kernel capabilities.
+    #[cfg(not(target_os = "macos"))]
     pub fn capabilities(&self) -> InitFlags {
         self.capabilities & !InitFlags::FUSE_INIT_EXT
     }
@@ -385,6 +395,7 @@ impl KernelConfig {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn max_pages(&self) -> u16 {
         ((max(self.max_write, self.max_readahead) - 1) / page_size::get() as u32) as u16 + 1
     }

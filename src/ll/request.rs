@@ -239,7 +239,6 @@ mod op {
     use std::convert::TryInto;
     use std::ffi::OsStr;
     use std::fmt::Display;
-    use std::mem::offset_of;
     use std::num::NonZeroU32;
     use std::path::Path;
     use std::time::SystemTime;
@@ -981,6 +980,7 @@ mod op {
     impl Init<'_> {
         pub(crate) fn capabilities(&self) -> InitFlags {
             let flags = InitFlags::from_bits_retain(u64::from(self.arg.flags));
+            #[cfg(not(target_os = "macos"))]
             if flags.contains(InitFlags::FUSE_INIT_EXT) {
                 return InitFlags::from_bits_retain(
                     u64::from(self.arg.flags) | (u64::from(self.arg.flags2) << 32),
@@ -995,6 +995,22 @@ mod op {
             super::Version(self.arg.major, self.arg.minor)
         }
 
+        #[cfg(target_os = "macos")]
+        pub(crate) fn reply(&self, config: &crate::KernelConfig) -> ResponseData {
+            let flags = config.requested & self.capabilities();
+            let init = fuse_init_out {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                max_readahead: config.max_readahead,
+                flags: flags.pair().0,
+                max_background: config.max_background,
+                congestion_threshold: config.congestion_threshold(),
+                max_write: config.max_write,
+            };
+            ResponseData::new_data(init.as_bytes())
+        }
+
+        #[cfg(not(target_os = "macos"))]
         pub(crate) fn reply(&self, config: &crate::KernelConfig) -> ResponseData {
             let flags = config.requested | InitFlags::FUSE_INIT_EXT;
             // use requested features and reported as capable
@@ -1033,6 +1049,23 @@ mod op {
 
         /// Reply with only our version, used when kernel major version > our major version.
         /// The kernel will then send a second INIT request with a compatible version.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn reply_version_only(&self) -> ResponseData {
+            let init = fuse_init_out {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: 0,
+                max_background: 0,
+                congestion_threshold: 0,
+                max_write: 0,
+            };
+            ResponseData::new_data(init.as_bytes())
+        }
+
+        /// Reply with only our version, used when kernel major version > our major version.
+        /// The kernel will then send a second INIT request with a compatible version.
+        #[cfg(not(target_os = "macos"))]
         pub(crate) fn reply_version_only(&self) -> ResponseData {
             let init = fuse_init_out {
                 major: FUSE_KERNEL_VERSION,
@@ -1752,7 +1785,7 @@ mod op {
                     let mut arg = fuse_init_in::new_zeroed();
                     let data = data.fetch_all();
                     // The oldest version of FUSE we support has four fields.
-                    if data.len() < offset_of!(fuse_init_in, flags2) {
+                    if data.len() < FUSE_COMPAT_INIT_IN_SIZE {
                         return None;
                     }
                     let prefix = cmp::min(data.len(), arg.as_bytes().len());
@@ -2219,8 +2252,65 @@ impl<'a> TryFrom<&'a [u8]> for AnyRequest<'a> {
 mod tests {
     use std::ffi::OsStr;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::KernelConfig;
+    #[cfg(target_os = "linux")]
+    use crate::ll::flags::init_flags::InitFlags;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::ll::reply::Response;
     use crate::ll::request::*;
     use crate::ll::test::AlignedData;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::ll::test::ioslice_to_vec;
+
+    #[cfg(all(target_os = "macos", target_endian = "little"))]
+    const MACOS_FSKIT_INIT_REQUEST: AlignedData<[u8; 56]> = AlignedData([
+        0x38, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, // len, opcode
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nodeid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uid, gid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x07, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, // major, minor
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xa0, 0x67, // max_readahead, flags
+    ]);
+
+    #[cfg(all(target_os = "macos", target_endian = "little"))]
+    const MACOS_FSKIT_INIT_REPLY: [u8; 40] = [
+        0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // len, error
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+        0x07, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, // major, minor
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
+        0x10, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x10, 0x00, // background, congestion, max_write
+    ];
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LINUX_EXTENDED_INIT_REQUEST: AlignedData<[u8; 104]> = AlignedData([
+        0x68, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, // len, opcode
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nodeid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uid, gid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x07, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, // major, minor
+        0x00, 0x10, 0x00, 0x00, 0x21, 0x00, 0xe0, 0xff, // max_readahead, flags
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags2, unused
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LINUX_EXTENDED_INIT_REPLY: [u8; 80] = [
+        0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // len, error
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+        0x07, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, // major, minor
+        0x00, 0x10, 0x00, 0x00, 0x21, 0x00, 0x40, 0x40, // max_readahead, flags
+        0x10, 0x00, 0x0c, 0x00, 0x00, 0x10, 0x00, 0x00, // background, congestion, max_write
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // time_gran, max_pages, unused
+        0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // flags2, max_stack_depth
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
 
     #[cfg(target_endian = "big")]
     const INIT_REQUEST: AlignedData<[u8; 104]> = AlignedData([
@@ -2312,6 +2402,71 @@ mod tests {
             }
             _ => panic!("Unexpected request operation"),
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_endian = "little"))]
+    #[test]
+    fn macos_fskit_init_uses_native_wire_layout_without_semantic_defaults() {
+        assert_eq!(size_of::<crate::ll::fuse_abi::fuse_init_in>(), 16);
+        assert_eq!(size_of::<crate::ll::fuse_abi::fuse_init_out>(), 24);
+
+        let request = AnyRequest::try_from(&MACOS_FSKIT_INIT_REQUEST[..]).unwrap();
+        let Operation::Init(init) = request.operation().unwrap() else {
+            panic!("Unexpected request operation");
+        };
+        assert_eq!(init.version(), Version(7, 19));
+        assert_eq!(init.capabilities().bits(), 0x67a0_0000);
+
+        let mut config =
+            KernelConfig::new(init.capabilities(), init.max_readahead(), init.version());
+        config.set_max_write(1024 * 1024).unwrap();
+
+        assert_eq!(
+            init.reply(&config).with_iovec(RequestId(1), ioslice_to_vec),
+            MACOS_FSKIT_INIT_REPLY
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn linux_extended_init_matches_pinned_uapi_fixture() {
+        assert_eq!(size_of::<crate::ll::fuse_abi::fuse_init_in>(), 64);
+        assert_eq!(size_of::<crate::ll::fuse_abi::fuse_init_out>(), 64);
+
+        let request = AnyRequest::try_from(&LINUX_EXTENDED_INIT_REQUEST[..]).unwrap();
+        let Operation::Init(init) = request.operation().unwrap() else {
+            panic!("Unexpected request operation");
+        };
+        assert_eq!(init.version(), Version(7, 40));
+        assert_eq!(init.capabilities().bits(), 0x20_ffe0_0021);
+
+        let mut config =
+            KernelConfig::new(init.capabilities(), init.max_readahead(), init.version());
+        config.set_max_write(4096).unwrap();
+        config
+            .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
+            .unwrap();
+        config.set_max_stack_depth(1).unwrap();
+
+        assert_eq!(
+            init.reply(&config).with_iovec(RequestId(1), ioslice_to_vec),
+            LINUX_EXTENDED_INIT_REPLY
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn linux_flags2_is_ignored_without_init_ext() {
+        let mut request = LINUX_EXTENDED_INIT_REQUEST;
+        request[55] &= !0x40;
+
+        let request = AnyRequest::try_from(&request[..]).unwrap();
+        let Operation::Init(init) = request.operation().unwrap() else {
+            panic!("Unexpected request operation");
+        };
+
+        assert!(!init.capabilities().contains(InitFlags::FUSE_INIT_EXT));
+        assert!(!init.capabilities().contains(InitFlags::FUSE_PASSTHROUGH));
     }
 
     #[test]
