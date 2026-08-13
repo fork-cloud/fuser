@@ -17,12 +17,16 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::thread::{self};
+use std::time::Duration;
+use std::time::Instant;
 
 use log::debug;
 use log::error;
-use log::info;
 use log::warn;
 use nix::unistd::Uid;
 use nix::unistd::geteuid;
@@ -107,15 +111,25 @@ impl<FS: Filesystem> Drop for FilesystemHolder<FS> {
 
 #[derive(Debug)]
 struct UmountOnDrop {
-    mount: Arc<Mutex<Option<Mount>>>,
+    mount: Option<Mount>,
 }
 
 impl UmountOnDrop {
-    fn umount(&self) -> io::Result<()> {
-        if let Some(mount) = self.mount.lock().take() {
-            mount.umount()?;
-        }
+    fn umount(&mut self) -> io::Result<()> {
+        self.umount_until(Instant::now() + Duration::from_secs(2))
+    }
+
+    fn umount_until(&mut self, deadline: Instant) -> io::Result<()> {
+        let Some(owner) = self.mount.as_mut() else {
+            return Ok(());
+        };
+        owner.umount(deadline)?;
+        self.mount = None;
         Ok(())
+    }
+
+    fn empty() -> Self {
+        Self { mount: None }
     }
 }
 
@@ -125,6 +139,18 @@ impl Drop for UmountOnDrop {
             warn!("Failed to umount filesystem: {}", e);
         }
     }
+}
+
+fn validate_mounted_session_config(options: &Config) -> io::Result<AclRequestIdentity> {
+    let acl_request_identity = validate_config(options)?;
+    if options.mount_options.contains(&MountOption::AutoUnmount) && options.acl == SessionACL::Owner
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("auto_unmount requires acl != Owner, got: {:?}", options.acl),
+        ));
+    }
+    Ok(acl_request_identity)
 }
 
 /// The session data structure
@@ -165,20 +191,9 @@ impl<FS: Filesystem> Session<FS> {
         mountpoint: P,
         options: &Config,
     ) -> io::Result<Session<FS>> {
-        let acl_request_identity = validate_config(options)?;
+        let acl_request_identity = validate_mounted_session_config(options)?;
 
         let mountpoint = mountpoint.as_ref();
-        info!("Mounting {}", mountpoint.display());
-        // If AutoUnmount is requested, but not AllowRoot or AllowOther, return an error
-        // because fusermount needs allow_root or allow_other to handle the auto_unmount option
-        if options.mount_options.contains(&MountOption::AutoUnmount)
-            && options.acl == SessionACL::Owner
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("auto_unmount requires acl != Owner, got: {:?}", options.acl),
-            ));
-        }
         let (ch, mount) = Mount::new(mountpoint, &options.mount_options, options.acl)?;
 
         let mut session = Session {
@@ -186,9 +201,7 @@ impl<FS: Filesystem> Session<FS> {
                 fs: Some(filesystem),
             },
             ch,
-            mount: UmountOnDrop {
-                mount: Arc::new(Mutex::new(Some(mount))),
-            },
+            mount: UmountOnDrop { mount: Some(mount) },
             allowed: options.acl,
             session_owner: geteuid(),
             acl_request_identity,
@@ -217,9 +230,7 @@ impl<FS: Filesystem> Session<FS> {
                 fs: Some(filesystem),
             },
             ch,
-            mount: UmountOnDrop {
-                mount: Arc::new(Mutex::new(None)),
-            },
+            mount: UmountOnDrop::empty(),
             allowed: acl,
             session_owner: geteuid(),
             acl_request_identity,
@@ -234,18 +245,24 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn spawn(self) -> io::Result<BackgroundSession> {
+    pub fn spawn(mut self) -> io::Result<BackgroundSession>
+    where
+        FS: Send + 'static,
+    {
         let sender = self.ch.sender();
-        // Take the fuse_session, so that we can unmount it
-        let mount = std::mem::take(&mut *self.mount.mount.lock());
+        let mount = std::mem::replace(&mut self.mount, UmountOnDrop::empty());
+        let session = Arc::new(Mutex::new(Some(self)));
+        let (activation, activation_receiver) = mpsc::channel();
         let guard = thread::Builder::new()
             .name("fuser-bg".to_string())
-            .spawn(move || self.run())?;
-        Ok(BackgroundSession {
-            guard,
+            .spawn(move || run_after_activation(session, activation_receiver))?;
+        let mut background = BackgroundSession {
             sender,
             mount,
-        })
+            dispatch: DispatchOwner::new(guard, activation),
+        };
+        background.activate()?;
+        Ok(background)
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -494,32 +511,213 @@ impl<FS: Filesystem> Session<FS> {
         self.mount.umount()
     }
 
-    /// Returns a thread-safe object that can be used to unmount the Filesystem
-    pub fn unmount_callable(&mut self) -> SessionUnmounter {
-        SessionUnmounter {
-            mount: self.mount.mount.clone(),
-        }
-    }
-
     /// Returns an object that can be used to send notifications to the kernel
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.sender())
     }
 }
 
-#[derive(Debug)]
-/// A thread-safe object that can be used to unmount a Filesystem
-pub struct SessionUnmounter {
-    mount: Arc<Mutex<Option<Mount>>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionOwnerState {
+    Prepared,
+    Constructing,
+    Transferred,
+    Released,
 }
 
-impl SessionUnmounter {
-    /// Unmount the filesystem
-    pub fn unmount(&mut self) -> io::Result<()> {
-        if let Some(mount) = std::mem::take(&mut *self.mount.lock()) {
-            mount.umount()?;
+/// Non-cloneable owner for recoverable native session construction.
+///
+/// [`SessionOwner::new`] performs validation and creates the owner before any
+/// native mount call. [`SessionOwner::construct`] mutates it through a borrow,
+/// so an error or caught unwind leaves the caller holding cleanup authority.
+#[derive(Debug)]
+pub struct SessionOwner<FS: Filesystem> {
+    filesystem: Option<FS>,
+    config: Config,
+    acl_request_identity: AclRequestIdentity,
+    session_owner: Uid,
+    mount: Option<UmountOnDrop>,
+    channel: Option<Channel>,
+    session: Option<Arc<Mutex<Option<Session<FS>>>>>,
+    state: SessionOwnerState,
+}
+
+/// Result of releasing a construction owner after construction did not finish.
+#[derive(Debug)]
+#[must_use]
+pub enum SessionOwnerShutdown {
+    /// Native release did not finish; the same owner remains retryable.
+    Pending(io::Error),
+    /// Every native owner held by the construction value was released.
+    Complete,
+}
+
+impl<FS: Filesystem + Send + 'static> SessionOwner<FS> {
+    /// Prepare a recoverable construction owner without acquiring native state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration or mountpoint is invalid.
+    pub fn new<P: AsRef<Path>>(
+        filesystem: FS,
+        mountpoint: P,
+        options: &Config,
+    ) -> io::Result<Self> {
+        let acl_request_identity = validate_mounted_session_config(options)?;
+        let mount = Mount::prepare(mountpoint.as_ref())?;
+        Ok(Self {
+            filesystem: Some(filesystem),
+            config: options.clone(),
+            acl_request_identity,
+            session_owner: geteuid(),
+            mount: Some(UmountOnDrop { mount: Some(mount) }),
+            channel: None,
+            session: None,
+            state: SessionOwnerState::Prepared,
+        })
+    }
+
+    /// Mount, complete INIT, and return a dispatch owner that is not active yet.
+    ///
+    /// Call [`BackgroundSession::activate`] only after storing the returned
+    /// owner. Before activation, the dispatch thread cannot admit ordinary
+    /// filesystem requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a construction or thread-spawn error. The caller retains `self`
+    /// and must drive [`SessionOwner::shutdown`] until it completes.
+    pub fn construct(&mut self) -> io::Result<BackgroundSession> {
+        if self.state != SessionOwnerState::Prepared {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session construction was already attempted",
+            ));
         }
+        self.state = SessionOwnerState::Constructing;
+        self.acquire_and_install_session()?;
+
+        let session = self.session.as_ref().ok_or_else(|| {
+            io::Error::other("session construction did not install its session owner")
+        })?;
+        let (sender, mount) = {
+            let mut slot = session.lock();
+            let session = slot
+                .as_mut()
+                .ok_or_else(|| io::Error::other("session construction lost its session owner"))?;
+            session.handshake()?;
+            let sender = session.ch.sender();
+            let mount = std::mem::replace(&mut session.mount, UmountOnDrop::empty());
+            (sender, mount)
+        };
+        self.mount = Some(mount);
+
+        let (activation, activation_receiver) = mpsc::channel();
+        let dispatch_session = session.clone();
+        let guard = thread::Builder::new()
+            .name("fuser-bg".to_string())
+            .spawn(move || run_after_activation(dispatch_session, activation_receiver))?;
+
+        let Some(mount) = self.mount.take() else {
+            drop(activation);
+            return Err(io::Error::other(
+                "session construction lost its native mount owner",
+            ));
+        };
+        self.session = None;
+        self.state = SessionOwnerState::Transferred;
+        Ok(BackgroundSession {
+            sender,
+            mount,
+            dispatch: DispatchOwner::new(guard, activation),
+        })
+    }
+
+    /// Retry release of every native owner retained after failed construction.
+    pub fn shutdown(&mut self, deadline: Instant) -> SessionOwnerShutdown {
+        let release = if let Some(mount) = self.mount.as_mut() {
+            mount.umount_until(deadline)
+        } else if let Some(session) = self.session.as_ref() {
+            let mut slot = session.lock();
+            match slot.as_mut() {
+                Some(session) => session.mount.umount_until(deadline),
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+
+        if let Err(error) = release {
+            return SessionOwnerShutdown::Pending(error);
+        }
+
+        self.mount = None;
+        self.channel = None;
+        self.session = None;
+        self.filesystem = None;
+        self.state = SessionOwnerState::Released;
+        SessionOwnerShutdown::Complete
+    }
+
+    fn acquire_and_install_session(&mut self) -> io::Result<()> {
+        let mount = self
+            .mount
+            .as_mut()
+            .ok_or_else(|| io::Error::other("session construction has no prepared mount owner"))?;
+        let channel = {
+            let owner = mount
+                .mount
+                .as_mut()
+                .ok_or_else(|| io::Error::other("session construction mount owner was released"))?;
+            owner.mount(&self.config.mount_options, self.config.acl)?
+        };
+        self.channel = Some(channel);
+
+        let filesystem = self
+            .filesystem
+            .take()
+            .ok_or_else(|| io::Error::other("session construction lost its filesystem owner"))?;
+        let channel = self
+            .channel
+            .take()
+            .ok_or_else(|| io::Error::other("session construction lost its channel owner"))?;
+        let mount = self
+            .mount
+            .take()
+            .ok_or_else(|| io::Error::other("session construction lost its mount owner"))?;
+        let session = Session {
+            filesystem: FilesystemHolder {
+                fs: Some(filesystem),
+            },
+            ch: channel,
+            mount,
+            allowed: self.config.acl,
+            session_owner: self.session_owner,
+            acl_request_identity: self.acl_request_identity,
+            proto_version: None,
+            config: self.config.clone(),
+        };
+        self.session = Some(Arc::new(Mutex::new(Some(session))));
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchCommand {
+    Activate,
+    Stop,
+}
+
+fn run_after_activation<FS: Filesystem + Send + 'static>(
+    session: Arc<Mutex<Option<Session<FS>>>>,
+    activation: Receiver<DispatchCommand>,
+) -> io::Result<()> {
+    let command = activation.recv().unwrap_or(DispatchCommand::Stop);
+    let session = session.lock().take();
+    match (command, session) {
+        (DispatchCommand::Activate, Some(session)) => session.run(),
+        (DispatchCommand::Stop, Some(_)) => Ok(()),
+        (_, None) => Err(io::Error::other("dispatch session owner was missing")),
     }
 }
 
@@ -568,40 +766,309 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
     }
 }
 
-/// The background session data structure
+#[derive(Debug)]
+enum DispatchActivation {
+    Waiting(Sender<DispatchCommand>),
+    Active,
+    Stopped,
+}
+
+/// Final result of the background dispatch thread.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatchOutcome {
+    /// The dispatch loop exited successfully.
+    Succeeded,
+    /// The dispatch loop returned an I/O error.
+    Failed {
+        /// Stable I/O error category.
+        kind: io::ErrorKind,
+        /// Error detail returned by the dispatch loop.
+        message: String,
+    },
+    /// The dispatch thread unwound.
+    Panicked,
+}
+
+/// Exhaustive result of one recoverable background-session shutdown attempt.
+#[derive(Debug)]
+#[must_use]
+pub enum BackgroundSessionShutdown {
+    /// The transport was retained after close or unmount did not complete.
+    TransportPending(io::Error),
+    /// The transport was released but the dispatch guard is not finished yet.
+    DispatchPending,
+    /// The transport was released and the dispatch guard was reaped.
+    Complete(DispatchOutcome),
+}
+
+#[derive(Debug)]
+struct DispatchOwner {
+    guard: Option<JoinHandle<io::Result<()>>>,
+    activation: DispatchActivation,
+    terminal: Option<DispatchOutcome>,
+}
+
+impl DispatchOwner {
+    fn new(guard: JoinHandle<io::Result<()>>, activation: Sender<DispatchCommand>) -> Self {
+        Self {
+            guard: Some(guard),
+            activation: DispatchActivation::Waiting(activation),
+            terminal: None,
+        }
+    }
+
+    fn activate(&mut self) -> io::Result<()> {
+        let result = match &self.activation {
+            DispatchActivation::Waiting(activation) => activation.send(DispatchCommand::Activate),
+            DispatchActivation::Active => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "filesystem dispatch is already active",
+                ));
+            }
+            DispatchActivation::Stopped => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "filesystem dispatch was stopped",
+                ));
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.activation = DispatchActivation::Active;
+                Ok(())
+            }
+            Err(_) => {
+                self.activation = DispatchActivation::Stopped;
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "filesystem dispatch thread exited before activation",
+                ))
+            }
+        }
+    }
+
+    fn shutdown_with(
+        &mut self,
+        deadline: Instant,
+        release_transport: impl FnOnce() -> io::Result<()>,
+    ) -> BackgroundSessionShutdown {
+        if let Some(outcome) = self.terminal.as_ref() {
+            return BackgroundSessionShutdown::Complete(outcome.clone());
+        }
+        if let Err(error) = release_transport() {
+            return BackgroundSessionShutdown::TransportPending(error);
+        }
+
+        if let DispatchActivation::Waiting(activation) = &self.activation {
+            let _ = activation.send(DispatchCommand::Stop);
+            self.activation = DispatchActivation::Stopped;
+        }
+
+        let Some(guard) = self.guard.as_ref() else {
+            return self.complete_missing_guard();
+        };
+        while !guard.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return BackgroundSessionShutdown::DispatchPending;
+            }
+            thread::park_timeout(Duration::from_millis(1).min(remaining));
+        }
+
+        let Some(guard) = self.guard.take() else {
+            return self.complete_missing_guard();
+        };
+        let outcome = match guard.join() {
+            Ok(Ok(())) => DispatchOutcome::Succeeded,
+            Ok(Err(error)) => DispatchOutcome::Failed {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+            Err(_) => DispatchOutcome::Panicked,
+        };
+        self.terminal = Some(outcome.clone());
+        BackgroundSessionShutdown::Complete(outcome)
+    }
+
+    fn complete_missing_guard(&mut self) -> BackgroundSessionShutdown {
+        let outcome = DispatchOutcome::Failed {
+            kind: io::ErrorKind::Other,
+            message: "filesystem dispatch guard was missing".to_string(),
+        };
+        self.terminal = Some(outcome.clone());
+        BackgroundSessionShutdown::Complete(outcome)
+    }
+}
+
+/// Non-cloneable owner of a mounted transport and its background dispatch guard.
 #[derive(Debug)]
 pub struct BackgroundSession {
-    /// Thread guard of the background session
-    pub guard: JoinHandle<io::Result<()>>,
-    /// Object for creating Notifiers for client use
     sender: ChannelSender,
-    /// Ensures the filesystem is unmounted when the session ends
-    mount: Option<Mount>,
+    mount: UmountOnDrop,
+    dispatch: DispatchOwner,
 }
 
 impl BackgroundSession {
-    /// Unmount the filesystem and join the background thread.
-    pub fn umount_and_join(mut self) -> io::Result<()> {
-        if let Some(mount) = self.mount.take() {
-            mount.umount()?;
-        }
-        self.join()
+    /// Admit ordinary filesystem requests after the caller has stored this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dispatch was already activated or its thread exited
+    /// before activation. The session remains available for shutdown.
+    pub fn activate(&mut self) -> io::Result<()> {
+        self.dispatch.activate()
     }
 
-    /// Returns an object that can be used to send notifications to the kernel
+    /// Release the transport first, then reap dispatch within one shared deadline.
+    ///
+    /// A non-complete result consumes no native owner. Call this method again on
+    /// the same value to resume shutdown.
+    pub fn shutdown(&mut self, deadline: Instant) -> BackgroundSessionShutdown {
+        let mount = &mut self.mount;
+        self.dispatch
+            .shutdown_with(deadline, || mount.umount_until(deadline))
+    }
+
+    /// Returns an object that can be used to send notifications to the kernel.
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.sender.clone())
     }
+}
 
-    /// Join the filesystem thread.
-    pub fn join(self) -> io::Result<()> {
-        self.guard
-            .join()
-            .map_err(|_panic: Box<dyn std::any::Any + Send>| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "filesystem background thread panicked",
-                )
-            })?
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::SyncSender;
+
+    use super::*;
+
+    fn dispatch_owner(task: impl FnOnce() -> io::Result<()> + Send + 'static) -> DispatchOwner {
+        let (activation, commands) = mpsc::channel();
+        let guard = thread::spawn(
+            move || match commands.recv().unwrap_or(DispatchCommand::Stop) {
+                DispatchCommand::Activate => task(),
+                DispatchCommand::Stop => Ok(()),
+            },
+        );
+        DispatchOwner::new(guard, activation)
+    }
+
+    fn blocking_dispatch() -> (DispatchOwner, Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let owner = dispatch_owner(move || {
+            entered_tx.send(()).map_err(io::Error::other)?;
+            release_rx.recv().map_err(io::Error::other)?;
+            Ok(())
+        });
+        (owner, entered_rx, release_tx)
+    }
+
+    #[test]
+    fn dispatch_does_not_run_before_explicit_activation() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_dispatch = ran.clone();
+        let mut owner = dispatch_owner(move || {
+            ran_in_dispatch.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(!ran.load(Ordering::SeqCst));
+        owner.activate().unwrap();
+        let result = owner.shutdown_with(Instant::now() + Duration::from_secs(1), || Ok(()));
+
+        assert!(ran.load(Ordering::SeqCst));
+        assert!(matches!(
+            result,
+            BackgroundSessionShutdown::Complete(DispatchOutcome::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn transport_error_retains_unstarted_dispatch_for_retry() {
+        let mut owner = dispatch_owner(|| Ok(()));
+
+        let first = owner.shutdown_with(Instant::now(), || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic Linux unmount failure",
+            ))
+        });
+        assert!(matches!(
+            first,
+            BackgroundSessionShutdown::TransportPending(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+
+        let second = owner.shutdown_with(Instant::now() + Duration::from_secs(1), || Ok(()));
+        assert!(matches!(
+            second,
+            BackgroundSessionShutdown::Complete(DispatchOutcome::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn released_transport_with_unfinished_dispatch_remains_retryable() {
+        let (mut owner, entered, release) = blocking_dispatch();
+        owner.activate().unwrap();
+        entered.recv().unwrap();
+
+        let first = owner.shutdown_with(Instant::now(), || Ok(()));
+        assert!(matches!(first, BackgroundSessionShutdown::DispatchPending));
+
+        release.send(()).unwrap();
+        let second = owner.shutdown_with(Instant::now() + Duration::from_secs(1), || Ok(()));
+        assert!(matches!(
+            second,
+            BackgroundSessionShutdown::Complete(DispatchOutcome::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn worker_unwind_is_reaped_after_transport_release() {
+        let mut owner = dispatch_owner(|| panic!("synthetic dispatch unwind"));
+        owner.activate().unwrap();
+
+        let pending = owner.shutdown_with(Instant::now() + Duration::from_secs(1), || {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "synthetic retained transport",
+            ))
+        });
+        assert!(matches!(
+            pending,
+            BackgroundSessionShutdown::TransportPending(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
+
+        let result = owner.shutdown_with(Instant::now() + Duration::from_secs(1), || Ok(()));
+
+        assert!(matches!(
+            result,
+            BackgroundSessionShutdown::Complete(DispatchOutcome::Panicked)
+        ));
+    }
+
+    #[test]
+    fn dispatch_io_error_is_preserved_as_terminal_outcome() {
+        let mut owner = dispatch_owner(|| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic dispatch failure",
+            ))
+        });
+        owner.activate().unwrap();
+
+        let result = owner.shutdown_with(Instant::now() + Duration::from_secs(1), || Ok(()));
+
+        assert!(matches!(
+            result,
+            BackgroundSessionShutdown::Complete(DispatchOutcome::Failed {
+                kind: io::ErrorKind::InvalidData,
+                ref message,
+            }) if message == "synthetic dispatch failure"
+        ));
     }
 }

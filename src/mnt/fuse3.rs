@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::SessionACL;
 use crate::dev_fuse::DevFuse;
@@ -30,16 +31,36 @@ fn ensure_last_os_error() -> io::Error {
 
 #[derive(Debug)]
 pub(crate) struct MountImpl {
-    fuse_session: *mut c_void,
+    fuse_session: Option<*mut c_void>,
     mountpoint: CString,
+    mounted: bool,
 }
 impl MountImpl {
-    pub(crate) fn new(
-        mnt: &Path,
+    pub(crate) fn prepare(mnt: &Path) -> io::Result<Self> {
+        let mountpoint = CString::new(mnt.as_os_str().as_bytes()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("mountpoint contains a null byte: {error}"),
+            )
+        })?;
+        Ok(Self {
+            fuse_session: None,
+            mountpoint,
+            mounted: false,
+        })
+    }
+
+    pub(crate) fn mount(
+        &mut self,
         options: &[MountOption],
         acl: SessionACL,
-    ) -> io::Result<(Arc<DevFuse>, MountImpl)> {
-        let mnt = CString::new(mnt.as_os_str().as_bytes()).unwrap();
+    ) -> io::Result<Arc<DevFuse>> {
+        if self.fuse_session.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "libfuse3 mount owner was already used",
+            ));
+        }
         with_fuse_args(options, acl, |args| {
             let ops = fuse_lowlevel_ops::default();
 
@@ -54,15 +75,13 @@ impl MountImpl {
             if fuse_session.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let mount = MountImpl {
-                fuse_session,
-                mountpoint: mnt.clone(),
-            };
-            let result = unsafe { fuse_session_mount(mount.fuse_session, mnt.as_ptr()) };
+            self.fuse_session = Some(fuse_session);
+            let result = unsafe { fuse_session_mount(fuse_session, self.mountpoint.as_ptr()) };
             if result != 0 {
                 return Err(ensure_last_os_error());
             }
-            let fd = unsafe { fuse_session_fd(mount.fuse_session) };
+            self.mounted = true;
+            let fd = unsafe { fuse_session_fd(fuse_session) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -71,24 +90,40 @@ impl MountImpl {
             // don't want it being closed out from under us:
             let fd = fd.try_clone_to_owned()?;
             let file = File::from(fd);
-            Ok((Arc::new(DevFuse(file)), mount))
+            Ok(Arc::new(DevFuse(file)))
         })
     }
 
-    pub(crate) fn umount_impl(&mut self) -> io::Result<()> {
-        if let Err(err) = crate::mnt::libc_umount(&self.mountpoint) {
-            // Linux always returns EPERM for non-root users.  We have to let the
-            // library go through the setuid-root "fusermount -u" to unmount.
-            if err == nix::errno::Errno::EPERM {
-                #[cfg(target_os = "linux")]
-                unsafe {
-                    fuse_session_unmount(self.fuse_session);
-                    fuse_session_destroy(self.fuse_session);
-                    return Ok(());
+    pub(crate) fn umount_impl(&mut self, _deadline: Instant) -> io::Result<()> {
+        let Some(fuse_session) = self.fuse_session else {
+            return Ok(());
+        };
+        if self.mounted {
+            if let Err(err) = crate::mnt::libc_umount(&self.mountpoint) {
+                // Linux always returns EPERM for non-root users.  We have to let the
+                // library go through the setuid-root "fusermount -u" to unmount.
+                if err == nix::errno::Errno::EPERM {
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        fuse_session_unmount(fuse_session);
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.mounted = false;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return Err(err.into());
+                    }
+                } else {
+                    return Err(err.into());
                 }
+            } else {
+                self.mounted = false;
             }
-            return Err(err.into());
         }
+        unsafe { fuse_session_destroy(fuse_session) };
+        self.fuse_session = None;
         Ok(())
     }
 }

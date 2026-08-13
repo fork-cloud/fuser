@@ -26,6 +26,7 @@ use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Instant;
 
 use log::debug;
 use log::error;
@@ -55,38 +56,59 @@ const MOUNT_FUSEFS_BIN: &str = "mount_fusefs";
 #[derive(Debug)]
 pub(crate) struct MountImpl {
     mountpoint: CString,
+    mounted: Option<Mounted>,
+}
+
+#[derive(Debug)]
+struct Mounted {
     auto_unmount_socket: Option<UnixStream>,
     fuse_device: Arc<DevFuse>,
 }
 impl MountImpl {
-    pub(crate) fn new(
-        mountpoint: &Path,
-        options: &[MountOption],
-        acl: SessionACL,
-    ) -> io::Result<(Arc<DevFuse>, MountImpl)> {
+    pub(crate) fn prepare(mountpoint: &Path) -> io::Result<Self> {
         let mountpoint = mountpoint.canonicalize()?;
-        let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options, acl)?;
-        let file = Arc::new(file);
-        Ok((
-            file.clone(),
-            MountImpl {
-                mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
-                auto_unmount_socket: sock,
-                fuse_device: file,
-            },
-        ))
+        Ok(Self {
+            mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
+            mounted: None,
+        })
     }
 
-    pub(crate) fn umount_impl(&mut self) -> io::Result<()> {
-        if !is_mounted(&self.fuse_device) {
+    pub(crate) fn mount(
+        &mut self,
+        options: &[MountOption],
+        acl: SessionACL,
+    ) -> io::Result<Arc<DevFuse>> {
+        if self.mounted.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pure-Rust mount owner was already used",
+            ));
+        }
+        let mountpoint = OsStr::from_bytes(self.mountpoint.to_bytes());
+        let (file, sock) = fuse_mount_pure(mountpoint, options, acl)?;
+        let file = Arc::new(file);
+        self.mounted = Some(Mounted {
+            auto_unmount_socket: sock,
+            fuse_device: file.clone(),
+        });
+        Ok(file)
+    }
+
+    pub(crate) fn umount_impl(&mut self, _deadline: Instant) -> io::Result<()> {
+        let Some(mounted) = self.mounted.as_mut() else {
+            return Ok(());
+        };
+        if !is_mounted(&mounted.fuse_device) {
             // If the filesystem has already been unmounted, avoid unmounting it again.
             // Unmounting it a second time could cause a race with a newly mounted filesystem
             // living at the same mountpoint
+            self.mounted = None;
             return Ok(());
         }
-        if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
+        if let Some(sock) = mem::take(&mut mounted.auto_unmount_socket) {
             drop(sock);
             // fusermount in auto-unmount mode, no more work to do.
+            self.mounted = None;
             return Ok(());
         }
         if let Err(err) = crate::mnt::libc_umount(&self.mountpoint) {
@@ -99,6 +121,7 @@ impl MountImpl {
                 return Err(err.into());
             }
         }
+        self.mounted = None;
         Ok(())
     }
 }

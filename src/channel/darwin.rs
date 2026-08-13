@@ -8,7 +8,6 @@ use std::time::Instant;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const WAKE_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -61,7 +60,6 @@ enum Lifecycle<Session, Channel> {
         session: Session,
         channel: Channel,
         active: ActiveCalls,
-        terminal: bool,
     },
     Closed,
 }
@@ -91,14 +89,12 @@ trait DarwinChannelApi: Debug + Send + Sync + 'static {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ShutdownTiming {
-    drain_timeout: Duration,
     wake_interval: Duration,
 }
 
 impl Default for ShutdownTiming {
     fn default() -> Self {
         Self {
-            drain_timeout: DRAIN_TIMEOUT,
             wake_interval: WAKE_INTERVAL,
         }
     }
@@ -114,7 +110,6 @@ struct Shared<A: DarwinChannelApi> {
 
 impl<A: DarwinChannelApi> Shared<A> {
     fn new(api: A, session: A::Session, channel: A::Channel, timing: ShutdownTiming) -> Arc<Self> {
-        assert!(!timing.drain_timeout.is_zero());
         assert!(!timing.wake_interval.is_zero());
         Arc::new(Self {
             api,
@@ -142,35 +137,30 @@ impl<A: DarwinChannelApi> Shared<A> {
         self.api.send(permit.channel, buffers)
     }
 
-    fn close(&self) -> io::Result<()> {
-        let deadline = Instant::now() + self.timing.drain_timeout;
-        let Some((session, channel)) = self.begin_close()? else {
+    fn close(&self, deadline: Instant) -> io::Result<()> {
+        let Some((session, channel, exit_session)) = self.begin_close() else {
             return Ok(());
         };
-        self.api.session_exit(session);
+        if exit_session {
+            self.api.session_exit(session);
+        }
 
         loop {
-            let (active, terminal) = {
+            let active = {
                 let lifecycle = self.lifecycle.lock();
                 match &*lifecycle {
-                    Lifecycle::Closing {
-                        active, terminal, ..
-                    } => (*active, *terminal),
+                    Lifecycle::Closing { active, .. } => *active,
                     Lifecycle::Closed => return Ok(()),
                     Lifecycle::Open { .. } => unreachable!("close must transition to Closing"),
                 }
             };
 
-            if terminal {
-                return Err(drain_timeout_error());
-            }
             if active.is_empty() {
                 break;
             }
 
             let now = Instant::now();
             if now >= deadline {
-                self.retain_after_timeout();
                 return Err(drain_timeout_error());
             }
             if active.receives != 0 {
@@ -189,8 +179,6 @@ impl<A: DarwinChannelApi> Shared<A> {
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                drop(lifecycle);
-                self.retain_after_timeout();
                 return Err(drain_timeout_error());
             }
             self.active_changed
@@ -205,13 +193,11 @@ impl<A: DarwinChannelApi> Shared<A> {
 
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
-            Lifecycle::Closing {
-                active,
-                terminal: false,
-                ..
-            } if active.is_empty() => *lifecycle = Lifecycle::Closed,
+            Lifecycle::Closing { active, .. } if active.is_empty() => {
+                *lifecycle = Lifecycle::Closed
+            }
             Lifecycle::Closing { .. } => {
-                unreachable!("successful drain must remain non-terminal and inactive")
+                unreachable!("successful drain must remain inactive")
             }
             Lifecycle::Closed => {}
             Lifecycle::Open { .. } => unreachable!("close must remain in Closing"),
@@ -226,17 +212,16 @@ impl<A: DarwinChannelApi> Shared<A> {
                 session,
                 channel,
                 active,
-                terminal: false,
             } if active.is_empty() => (*session, *channel),
             Lifecycle::Closing { .. } => {
-                unreachable!("only an inactive, non-terminal channel can be released")
+                unreachable!("only an inactive channel can be released")
             }
             Lifecycle::Open { .. } => unreachable!("release requires Closing state"),
             Lifecycle::Closed => unreachable!("Closed state has no provider handles"),
         }
     }
 
-    fn begin_close(&self) -> io::Result<Option<(A::Session, A::Channel)>> {
+    fn begin_close(&self) -> Option<(A::Session, A::Channel, bool)> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             Lifecycle::Open {
@@ -249,25 +234,13 @@ impl<A: DarwinChannelApi> Shared<A> {
                     session,
                     channel,
                     active,
-                    terminal: false,
                 };
-                Ok(Some((session, channel)))
+                Some((session, channel, true))
             }
-            Lifecycle::Closing { terminal: true, .. } => Err(drain_timeout_error()),
-            Lifecycle::Closing { .. } => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "macFUSE channel close is already in progress",
-            )),
-            Lifecycle::Closed => Ok(None),
-        }
-    }
-
-    fn retain_after_timeout(&self) {
-        let mut lifecycle = self.lifecycle.lock();
-        match &mut *lifecycle {
-            Lifecycle::Closing { terminal, .. } => *terminal = true,
-            Lifecycle::Closed => {}
-            Lifecycle::Open { .. } => unreachable!("timeout requires Closing state"),
+            Lifecycle::Closing {
+                session, channel, ..
+            } => Some((*session, *channel, false)),
+            Lifecycle::Closed => None,
         }
     }
 
@@ -321,7 +294,7 @@ impl<A: DarwinChannelApi> Drop for CallPermit<A> {
 fn drain_timeout_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
-        "macFUSE channel calls did not drain within two seconds; provider state was retained",
+        "macFUSE channel calls did not drain before the deadline; provider state was retained",
     )
 }
 
@@ -481,15 +454,44 @@ mod real {
     }
 
     #[derive(Debug)]
+    enum MountedChannelOwnerState {
+        Empty,
+        Channel(ChannelHandle),
+        UnattachedSession {
+            session: SessionHandle,
+            channel: ChannelHandle,
+        },
+        AttachedSession {
+            session: SessionHandle,
+            channel: ChannelHandle,
+        },
+        Mounted(Arc<Shared<RealApi>>),
+        Released,
+    }
+
+    #[derive(Debug)]
     pub(crate) struct MountedChannelOwner {
-        shared: Arc<Shared<RealApi>>,
+        state: MountedChannelOwnerState,
     }
 
     impl MountedChannelOwner {
+        pub(crate) fn new() -> Self {
+            Self {
+                state: MountedChannelOwnerState::Empty,
+            }
+        }
+
         pub(crate) fn mount(
+            &mut self,
             mountpoint: &std::ffi::CStr,
             args: &mut fuse_args,
-        ) -> io::Result<(MountedChannel, Self)> {
+        ) -> io::Result<MountedChannel> {
+            if !matches!(self.state, MountedChannelOwnerState::Empty) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "macFUSE channel owner was already used",
+                ));
+            }
             // SAFETY: `mountpoint` and every argv string remain live through the call;
             // `args` is exclusively borrowed because libfuse rewrites it while parsing.
             let raw_channel = unsafe { fuse2_sys::fuse_mount(mountpoint.as_ptr(), args) };
@@ -504,6 +506,8 @@ mod real {
             unsafe { fuse2_sys::fuse_opt_free_args(args) }
             // SAFETY: the null case returned above.
             let channel = unsafe { NonNull::new_unchecked(raw_channel) };
+            let channel = ChannelHandle(channel);
+            self.state = MountedChannelOwnerState::Channel(channel);
 
             let mut ops = fuse_session_ops {
                 process: Some(ignore_request),
@@ -516,28 +520,66 @@ mod real {
                 NonNull::new(unsafe { fuse2_sys::fuse_session_new(&mut ops, ptr::null_mut()) })
             else {
                 let error = ensure_last_os_error();
-                // SAFETY: the unattached channel is live. Darwin unmount preserves the
-                // owner's reference, which the following destroy releases exactly once.
-                unsafe {
-                    fuse2_sys::fuse_darwin_chan_unmount(channel.as_ptr());
-                    fuse2_sys::fuse_chan_destroy(channel.as_ptr());
-                }
+                self.close(Instant::now())?;
                 return Err(error);
             };
+            let session = SessionHandle(session);
+            self.state = MountedChannelOwnerState::UnattachedSession { session, channel };
 
             // SAFETY: both objects are live, unattached, and exclusively lifecycle-owned.
-            unsafe { fuse2_sys::fuse_session_add_chan(session.as_ptr(), channel.as_ptr()) }
-            let shared = Shared::new(
-                RealApi,
-                SessionHandle(session),
-                ChannelHandle(channel),
-                ShutdownTiming::default(),
-            );
-            Ok((MountedChannel(shared.clone()), Self { shared }))
+            unsafe { fuse2_sys::fuse_session_add_chan(session.0.as_ptr(), channel.0.as_ptr()) }
+            self.state = MountedChannelOwnerState::AttachedSession { session, channel };
+            let shared = Shared::new(RealApi, session, channel, ShutdownTiming::default());
+            self.state = MountedChannelOwnerState::Mounted(shared.clone());
+            Ok(MountedChannel(shared))
         }
 
-        pub(crate) fn close(self) -> io::Result<()> {
-            self.shared.close()
+        pub(crate) fn close(&mut self, deadline: Instant) -> io::Result<()> {
+            match &self.state {
+                MountedChannelOwnerState::Empty => {
+                    self.state = MountedChannelOwnerState::Released;
+                    Ok(())
+                }
+                MountedChannelOwnerState::Channel(channel) => {
+                    let channel = *channel;
+                    // SAFETY: the unattached channel is live and exclusively owned.
+                    unsafe {
+                        fuse2_sys::fuse_darwin_chan_unmount(channel.0.as_ptr());
+                        fuse2_sys::fuse_chan_destroy(channel.0.as_ptr());
+                    }
+                    self.state = MountedChannelOwnerState::Released;
+                    Ok(())
+                }
+                MountedChannelOwnerState::UnattachedSession { session, channel } => {
+                    let (session, channel) = (*session, *channel);
+                    // SAFETY: neither owner is attached or visible to a request loop.
+                    unsafe {
+                        fuse2_sys::fuse_session_destroy(session.0.as_ptr());
+                        fuse2_sys::fuse_darwin_chan_unmount(channel.0.as_ptr());
+                        fuse2_sys::fuse_chan_destroy(channel.0.as_ptr());
+                    }
+                    self.state = MountedChannelOwnerState::Released;
+                    Ok(())
+                }
+                MountedChannelOwnerState::AttachedSession { session, channel } => {
+                    let (session, channel) = (*session, *channel);
+                    // SAFETY: no channel clone was published before Shared was installed.
+                    unsafe {
+                        fuse2_sys::fuse_session_remove_chan(channel.0.as_ptr());
+                        fuse2_sys::fuse_session_destroy(session.0.as_ptr());
+                        fuse2_sys::fuse_darwin_chan_unmount(channel.0.as_ptr());
+                        fuse2_sys::fuse_chan_destroy(channel.0.as_ptr());
+                    }
+                    self.state = MountedChannelOwnerState::Released;
+                    Ok(())
+                }
+                MountedChannelOwnerState::Mounted(shared) => {
+                    shared.close(deadline)?;
+                    self.state = MountedChannelOwnerState::Released;
+                    Ok(())
+                }
+                MountedChannelOwnerState::Released => Ok(()),
+            }
         }
     }
 
@@ -969,8 +1011,12 @@ mod tests {
         let api = FakeApi::new(mode, ReceiveMode::Return);
         let shared = shared(api.clone(), ShutdownTiming::default());
 
-        shared.close().unwrap();
-        shared.close().unwrap();
+        shared
+            .close(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        shared
+            .close(Instant::now() + Duration::from_secs(1))
+            .unwrap();
         if mode == UnmountMode::Asynchronous {
             api.complete_async_worker();
         }
@@ -1011,7 +1057,6 @@ mod tests {
         assert_eq!(
             ShutdownTiming::default(),
             ShutdownTiming {
-                drain_timeout: Duration::from_secs(2),
                 wake_interval: Duration::from_millis(25),
             }
         );
@@ -1068,7 +1113,6 @@ mod tests {
         let shared = shared(
             api.clone(),
             ShutdownTiming {
-                drain_timeout: Duration::from_secs(1),
                 wake_interval: Duration::from_millis(5),
             },
         );
@@ -1081,7 +1125,9 @@ mod tests {
         };
         api.wait_for_receive_entry();
 
-        shared.close().unwrap();
+        shared
+            .close(Instant::now() + Duration::from_secs(1))
+            .unwrap();
         receiver.join().unwrap();
 
         assert!(
@@ -1106,7 +1152,11 @@ mod tests {
 
         let closer = {
             let shared = shared.clone();
-            thread::spawn(move || shared.close().unwrap())
+            thread::spawn(move || {
+                shared
+                    .close(Instant::now() + Duration::from_secs(1))
+                    .unwrap()
+            })
         };
         api.wait_for_event(Event::SessionExit);
         assert_eq!(lifecycle_events(&api.events()), [Event::SessionExit]);
@@ -1127,12 +1177,11 @@ mod tests {
     }
 
     #[test]
-    fn drain_timeout_retains_pointers_and_never_runs_lifecycle_release() {
+    fn drain_timeout_retains_pointers_for_successful_retry() {
         let api = FakeApi::new(UnmountMode::Synchronous, ReceiveMode::IgnoreInterrupts);
         let shared = shared(
             api.clone(),
             ShutdownTiming {
-                drain_timeout: Duration::from_millis(30),
                 wake_interval: Duration::from_millis(5),
             },
         );
@@ -1145,7 +1194,9 @@ mod tests {
         };
         api.wait_for_receive_entry();
 
-        let error = shared.close().unwrap_err();
+        let error = shared
+            .close(Instant::now() + Duration::from_millis(30))
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(api.channel_references(), 1);
         assert_eq!(
@@ -1153,7 +1204,6 @@ mod tests {
             [Event::SessionExit],
             "timeout must not detach, destroy, or unmount"
         );
-        assert_eq!(shared.close().unwrap_err().kind(), io::ErrorKind::TimedOut);
         let events_before_late_calls = api.events();
         assert_eq!(
             shared.send(&[IoSlice::new(b"late")]).unwrap_err().kind(),
@@ -1165,8 +1215,27 @@ mod tests {
 
         api.release_receive();
         receiver.join().unwrap();
-        assert_eq!(api.channel_references(), 1);
-        assert_eq!(lifecycle_events(&api.events()), [Event::SessionExit]);
+        shared
+            .close(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(api.channel_references(), 0);
+        assert_eq!(
+            lifecycle_events(&api.events()),
+            [
+                Event::SessionExit,
+                Event::SessionRemoveChannel,
+                Event::SessionDestroy,
+                Event::DarwinUnmount,
+                Event::ChannelDestroy,
+            ]
+        );
+        assert_eq!(
+            api.events()
+                .iter()
+                .filter(|event| **event == Event::SessionExit)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1175,7 +1244,9 @@ mod tests {
         let shared = shared(api.clone(), ShutdownTiming::default());
         let sender = shared.clone();
 
-        shared.close().unwrap();
+        shared
+            .close(Instant::now() + Duration::from_secs(1))
+            .unwrap();
         assert_eq!(
             sender.send(&[IoSlice::new(b"late")]).unwrap_err().kind(),
             io::ErrorKind::NotConnected

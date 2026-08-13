@@ -64,6 +64,8 @@ fn with_fuse_args<T, F: FnOnce(&mut fuse_args) -> T>(
 use std::ffi::CStr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::SessionACL;
 
@@ -78,17 +80,60 @@ enum MountImpl {
 }
 
 impl MountImpl {
-    fn umount_impl(&mut self) -> io::Result<()> {
+    fn prepare(mountpoint: &Path) -> io::Result<Self> {
+        #[cfg(fuser_mount_impl = "pure-rust")]
+        {
+            Ok(Self::Pure(fuse_pure::MountImpl::prepare(mountpoint)?))
+        }
+        #[cfg(fuser_mount_impl = "libfuse2")]
+        {
+            Ok(Self::Fuse2(fuse2::MountImpl::prepare(mountpoint)?))
+        }
+        #[cfg(fuser_mount_impl = "libfuse3")]
+        {
+            Ok(Self::Fuse3(fuse3::MountImpl::prepare(mountpoint)?))
+        }
+        #[cfg(fuser_mount_impl = "macos-no-mount")]
+        {
+            let _ = mountpoint;
+            Err(io::Error::other(
+                "Mount is not enabled; this is test-only configuration",
+            ))
+        }
+    }
+
+    fn mount(&mut self, options: &[MountOption], acl: SessionACL) -> io::Result<Channel> {
         match self {
             #[cfg(fuser_mount_impl = "pure-rust")]
-            MountImpl::Pure(mount) => mount.umount_impl(),
+            Self::Pure(mount) => mount.mount(options, acl).map(Channel::from_device),
             #[cfg(fuser_mount_impl = "libfuse2")]
-            MountImpl::Fuse2(mount) => mount.umount_impl(),
+            Self::Fuse2(mount) => mount.mount(options, acl),
             #[cfg(fuser_mount_impl = "libfuse3")]
-            MountImpl::Fuse3(mount) => mount.umount_impl(),
+            Self::Fuse3(mount) => mount.mount(options, acl).map(Channel::from_device),
+            #[cfg(fuser_mount_impl = "macos-no-mount")]
+            _ => {
+                let _ = (options, acl);
+                Err(io::Error::other(
+                    "Mount is not enabled; this is test-only configuration",
+                ))
+            }
+        }
+    }
+
+    fn umount_impl(&mut self, deadline: Instant) -> io::Result<()> {
+        match self {
+            #[cfg(fuser_mount_impl = "pure-rust")]
+            MountImpl::Pure(mount) => mount.umount_impl(deadline),
+            #[cfg(fuser_mount_impl = "libfuse2")]
+            MountImpl::Fuse2(mount) => mount.umount_impl(deadline),
+            #[cfg(fuser_mount_impl = "libfuse3")]
+            MountImpl::Fuse3(mount) => mount.umount_impl(deadline),
             // This branch is needed because Rust does not consider & empty enum non-empty.
             #[cfg(fuser_mount_impl = "macos-no-mount")]
-            _ => Ok(()),
+            _ => {
+                let _ = deadline;
+                Ok(())
+            }
         }
     }
 }
@@ -99,72 +144,66 @@ pub(crate) struct Mount {
     mount_point: PathBuf,
 }
 
+fn release_retained<T>(
+    owner: &mut Option<T>,
+    release: impl FnOnce(&mut T) -> io::Result<()>,
+) -> io::Result<()> {
+    let Some(value) = owner.as_mut() else {
+        return Ok(());
+    };
+    release(value)?;
+    *owner = None;
+    Ok(())
+}
+
 impl Mount {
+    pub(crate) fn prepare(mountpoint: &Path) -> io::Result<Self> {
+        Ok(Self {
+            mount_impl: Some(MountImpl::prepare(mountpoint)?),
+            mount_point: mountpoint.to_path_buf(),
+        })
+    }
+
+    pub(crate) fn mount(
+        &mut self,
+        options: &[MountOption],
+        acl: SessionACL,
+    ) -> io::Result<Channel> {
+        let Some(mount) = self.mount_impl.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "mount owner was already released",
+            ));
+        };
+        info!("Mounting {}", self.mount_point.display());
+        mount.mount(options, acl)
+    }
+
     pub(crate) fn new(
         mountpoint: &Path,
         options: &[MountOption],
         acl: SessionACL,
-    ) -> io::Result<(Channel, Mount)> {
-        #[cfg(fuser_mount_impl = "pure-rust")]
-        {
-            let (dev_fuse, mount) = fuse_pure::MountImpl::new(mountpoint, options, acl)?;
-            Ok((
-                Channel::from_device(dev_fuse),
-                Mount {
-                    mount_impl: Some(MountImpl::Pure(mount)),
-                    mount_point: mountpoint.to_path_buf(),
-                },
-            ))
-        }
-        #[cfg(fuser_mount_impl = "libfuse2")]
-        {
-            let (channel, mount) = fuse2::MountImpl::new(mountpoint, options, acl)?;
-            Ok((
-                channel,
-                Mount {
-                    mount_impl: Some(MountImpl::Fuse2(mount)),
-                    mount_point: mountpoint.to_path_buf(),
-                },
-            ))
-        }
-        #[cfg(fuser_mount_impl = "libfuse3")]
-        {
-            let (dev_fuse, mount) = fuse3::MountImpl::new(mountpoint, options, acl)?;
-            Ok((
-                Channel::from_device(dev_fuse),
-                Mount {
-                    mount_impl: Some(MountImpl::Fuse3(mount)),
-                    mount_point: mountpoint.to_path_buf(),
-                },
-            ))
-        }
-        #[cfg(fuser_mount_impl = "macos-no-mount")]
-        {
-            let _ = (mountpoint, options, acl);
-            Err(io::Error::other(
-                "Mount is not enabled; this is test-only configuration",
-            ))
-        }
+    ) -> io::Result<(Channel, Self)> {
+        let mut mount = Self::prepare(mountpoint)?;
+        let channel = mount.mount(options, acl)?;
+        Ok((channel, mount))
     }
 
-    pub(crate) fn umount(mut self) -> io::Result<()> {
-        match self.mount_impl.take() {
-            Some(mut mount) => {
-                info!("Unmounting {}", self.mount_point.display());
-                mount.umount_impl()
-            }
-            None => Ok(()),
-        }
+    pub(crate) fn umount(&mut self, deadline: Instant) -> io::Result<()> {
+        let mount_point = &self.mount_point;
+        release_retained(&mut self.mount_impl, |mount| {
+            info!("Unmounting {}", mount_point.display());
+            mount.umount_impl(deadline)
+        })
     }
 }
 
 impl Drop for Mount {
     fn drop(&mut self) {
-        if let Some(mut mount) = self.mount_impl.take() {
-            if let Err(err) = mount.umount_impl() {
-                // This is not necessarily an error: may happen if a user called 'umount'.
-                warn!("Unmount failed: {}", err);
-            }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        if let Err(err) = self.umount(deadline) {
+            // This is not necessarily an error: may happen if a user called 'umount'.
+            warn!("Unmount failed: {}", err);
         }
     }
 }
@@ -271,6 +310,32 @@ mod test {
                 .collect();
             assert_eq!(*values, ["rust-fuse", "-o", "backend=fskit"]);
         });
+    }
+
+    #[test]
+    fn failed_unmount_retains_the_same_backend_for_retry() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Backend {
+            attempts: usize,
+        }
+
+        let mut owner = Some(Backend { attempts: 0 });
+        let first = release_retained(&mut owner, |backend| {
+            backend.attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic unmount failure",
+            ))
+        });
+        assert_eq!(first.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(owner, Some(Backend { attempts: 1 }));
+
+        release_retained(&mut owner, |backend| {
+            backend.attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(owner, None);
     }
 
     #[cfg(not(target_os = "macos"))]

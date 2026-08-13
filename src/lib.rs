@@ -77,10 +77,13 @@ pub use crate::reply::ReplyWrite;
 pub use crate::reply::ReplyXattr;
 pub use crate::request_param::Request;
 pub use crate::session::BackgroundSession;
+pub use crate::session::BackgroundSessionShutdown;
+pub use crate::session::DispatchOutcome;
 use crate::session::MAX_WRITE_SIZE;
 pub use crate::session::Session;
 pub use crate::session::SessionACL;
-pub use crate::session::SessionUnmounter;
+pub use crate::session::SessionOwner;
+pub use crate::session::SessionOwnerShutdown;
 
 mod access_flags;
 mod bsd_file_flags;

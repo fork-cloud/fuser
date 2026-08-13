@@ -4,6 +4,7 @@
 * Use libfuse2 message channels on macOS, including FSKit providers without a FUSE file descriptor
 * Add typed FSKit backend selection with provider-aware owner ACL checks
 * Separate the macOS and standard FUSE INIT capability namespaces and wire layouts
+* Add recoverable session construction and deadline-bounded, retryable shutdown ownership
 
 ## 0.18.0 - 2026-07-22
 * Remove deprecated feature flags `abi-*`
