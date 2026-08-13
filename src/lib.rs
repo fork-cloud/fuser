@@ -19,6 +19,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -217,7 +218,9 @@ pub struct KernelConfig {
     max_background: u16,
     congestion_threshold: Option<u16>,
     max_write: u32,
+    #[cfg(not(target_os = "macos"))]
     time_gran: Duration,
+    #[cfg(not(target_os = "macos"))]
     max_stack_depth: u32,
     kernel_abi: Version,
 }
@@ -234,7 +237,9 @@ impl KernelConfig {
             // use a max write size that fits into the session's buffer
             max_write: MAX_WRITE_SIZE as u32,
             // 1ns means nano-second granularity.
+            #[cfg(not(target_os = "macos"))]
             time_gran: Duration::new(0, 1),
+            #[cfg(not(target_os = "macos"))]
             max_stack_depth: 0,
             kernel_abi,
         }
@@ -254,6 +259,7 @@ impl KernelConfig {
     /// On success, returns the previous value.  
     /// # Errors
     /// If argument is too large, returns the nearest value which will succeed.
+    #[cfg(not(target_os = "macos"))]
     pub fn set_max_stack_depth(&mut self, value: u32) -> Result<u32, u32> {
         // https://lore.kernel.org/linux-fsdevel/CAOYeF9V_n93OEF_uf0Gwtd=+da0ReX8N2aaT6RfEJ9DPvs8O2w@mail.gmail.com/
         const FILESYSTEM_MAX_STACK_DEPTH: u32 = 2;
@@ -274,6 +280,7 @@ impl KernelConfig {
     /// On success returns the previous value.  
     /// # Errors
     /// If the argument does not match any valid granularity, returns the nearest value which will succeed.
+    #[cfg(not(target_os = "macos"))]
     pub fn set_time_granularity(&mut self, value: Duration) -> Result<Duration, Duration> {
         if value.as_nanos() == 0 {
             return Err(Duration::new(0, 1));
