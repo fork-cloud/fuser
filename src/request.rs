@@ -21,6 +21,7 @@ use crate::ll;
 use crate::ll::Errno;
 use crate::ll::ResponseData;
 use crate::ll::ResponseErrno;
+use crate::mnt::mount_options::AclRequestIdentity;
 use crate::reply::Reply;
 use crate::reply::ReplyDirectory;
 use crate::reply::ReplyDirectoryPlus;
@@ -28,6 +29,39 @@ use crate::reply::ReplyRaw;
 use crate::reply::ReplySender;
 use crate::session::SessionACL;
 use crate::session::SessionEventLoop;
+
+fn acl_rejects(
+    acl: SessionACL,
+    identity: AclRequestIdentity,
+    request_uid: nix::unistd::Uid,
+    session_owner: nix::unistd::Uid,
+    operation: &ll::Operation<'_>,
+) -> bool {
+    let identity_rejected = match acl {
+        SessionACL::All => false,
+        SessionACL::RootAndOwner => request_uid != session_owner && !request_uid.is_root(),
+        SessionACL::Owner => !identity.matches_owner_acl(request_uid, session_owner),
+    };
+    if !identity_rejected {
+        return false;
+    }
+
+    !matches!(
+        operation,
+        ll::Operation::Init(_)
+            | ll::Operation::Destroy(_)
+            | ll::Operation::Read(_)
+            | ll::Operation::ReadDir(_)
+            | ll::Operation::BatchForget(_)
+            | ll::Operation::Forget(_)
+            | ll::Operation::Write(_)
+            | ll::Operation::FSync(_)
+            | ll::Operation::FSyncDir(_)
+            | ll::Operation::Release(_)
+            | ll::Operation::ReleaseDir(_)
+            | ll::Operation::ReadDirPlus(_)
+    )
+}
 
 /// Request data structure
 #[derive(Debug)]
@@ -69,32 +103,14 @@ impl<'a> RequestWithSender<'a> {
         se: &SessionEventLoop<FS>,
     ) -> Result<Option<ResponseData>, Errno> {
         let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
-        // Implement allow_root & access check for auto_unmount
-        if (se.allowed == SessionACL::RootAndOwner
-            && self.request.uid() != se.session_owner
-            && !self.request.uid().is_root())
-            || (se.allowed == SessionACL::Owner && self.request.uid() != se.session_owner)
-        {
-            {
-                match op {
-                    // Only allow operations that the kernel may issue without a uid set
-                    ll::Operation::Init(_)
-                    | ll::Operation::Destroy(_)
-                    | ll::Operation::Read(_)
-                    | ll::Operation::ReadDir(_)
-                    | ll::Operation::BatchForget(_)
-                    | ll::Operation::Forget(_)
-                    | ll::Operation::Write(_)
-                    | ll::Operation::FSync(_)
-                    | ll::Operation::FSyncDir(_)
-                    | ll::Operation::Release(_)
-                    | ll::Operation::ReleaseDir(_) => {}
-                    ll::Operation::ReadDirPlus(_) => {}
-                    _ => {
-                        return Err(Errno::EACCES);
-                    }
-                }
-            }
+        if acl_rejects(
+            se.allowed,
+            se.acl_request_identity,
+            self.request.uid(),
+            se.session_owner,
+            &op,
+        ) {
+            return Err(Errno::EACCES);
         }
 
         let Some(filesystem) = &se.filesystem.fs else {
@@ -559,5 +575,55 @@ impl<'a> RequestWithSender<'a> {
     #[inline]
     fn request_header(&self) -> &Request {
         Request::ref_cast(self.request.header())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::TryFrom;
+
+    use nix::unistd::Uid;
+
+    use super::*;
+
+    #[repr(align(8))]
+    struct AlignedData<T>(T);
+
+    #[test]
+    fn fs_kit_acl_comparison_does_not_rewrite_request_metadata() {
+        let bytes = AlignedData([
+            0x28, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, // len, STATFS
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // root inode
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uid, gid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        ]);
+        let request = ll::AnyRequest::try_from(&bytes.0[..]).unwrap();
+        let owner = Uid::from_raw(501);
+        let operation = request.operation().unwrap();
+
+        assert!(acl_rejects(
+            SessionACL::Owner,
+            AclRequestIdentity::Direct,
+            request.uid(),
+            owner,
+            &operation,
+        ));
+        assert!(!acl_rejects(
+            SessionACL::Owner,
+            AclRequestIdentity::MacFsKitRootProxy,
+            request.uid(),
+            owner,
+            &operation,
+        ));
+        let callback_request = Request::ref_cast(request.header());
+        assert_eq!(
+            (
+                callback_request.uid(),
+                callback_request.gid(),
+                callback_request.pid(),
+            ),
+            (0, 0, 0)
+        );
     }
 }

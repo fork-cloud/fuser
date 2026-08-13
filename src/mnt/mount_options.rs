@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 
+use nix::unistd::Uid;
+
 use crate::SessionACL;
 
 /// Fuser session configuration, including mount options.
@@ -32,6 +34,12 @@ pub enum MountOption {
     /// Allows passing an option which is not otherwise supported in these enums
     #[allow(clippy::upper_case_acronyms)]
     CUSTOM(String),
+
+    /// Select macFUSE's FSKit backend.
+    ///
+    /// This option is accepted only by the macOS libfuse2 mount path. Use of
+    /// `backend=fskit` through [`MountOption::CUSTOM`] is rejected.
+    MacFsKit,
 
     /* Parameterless options */
     /// Automatically unmount when the mounting process exits
@@ -91,6 +99,7 @@ impl MountOption {
             "dirsync" => MountOption::DirSync,
             "sync" => MountOption::Sync,
             "async" => MountOption::Async,
+            "backend=fskit" => MountOption::MacFsKit,
             x if x.starts_with("fsname=") => MountOption::FSName(x[7..].into()),
             x if x.starts_with("subtype=") => MountOption::Subtype(x[8..].into()),
             x => MountOption::CUSTOM(x.into()),
@@ -106,7 +115,20 @@ pub(crate) enum MountOptionGroup {
     Fusermount,
 }
 
-pub(crate) fn check_option_conflicts(options: &Config) -> Result<(), io::Error> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AclRequestIdentity {
+    Direct,
+    MacFsKitRootProxy,
+}
+
+impl AclRequestIdentity {
+    pub(crate) fn matches_owner_acl(self, request_uid: Uid, session_owner: Uid) -> bool {
+        request_uid == session_owner
+            || (self == AclRequestIdentity::MacFsKitRootProxy && request_uid.is_root())
+    }
+}
+
+pub(crate) fn validate_config(options: &Config) -> Result<AclRequestIdentity, io::Error> {
     let mut options_set = HashSet::new();
     options_set.extend(options.mount_options.iter().cloned());
     let conflicting: HashSet<MountOption> = options
@@ -115,14 +137,37 @@ pub(crate) fn check_option_conflicts(options: &Config) -> Result<(), io::Error> 
         .flat_map(conflicts_with)
         .collect();
     let intersection: Vec<MountOption> = conflicting.intersection(&options_set).cloned().collect();
-    if intersection.is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    if !intersection.is_empty() {
+        return Err(io::Error::new(
             ErrorKind::InvalidInput,
             format!("Conflicting mount options found: {intersection:?}"),
-        ))
+        ));
     }
+
+    if options.mount_options.iter().any(|option| {
+        matches!(
+            option,
+            MountOption::CUSTOM(value)
+                if value.split(',').any(|token| token == "backend=fskit")
+        )
+    }) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "backend=fskit must use MountOption::MacFsKit",
+        ));
+    }
+
+    if options.mount_options.contains(&MountOption::MacFsKit) {
+        if !cfg!(all(target_os = "macos", fuser_mount_impl = "libfuse2")) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "MountOption::MacFsKit requires the macOS libfuse2 mount path",
+            ));
+        }
+        return Ok(AclRequestIdentity::MacFsKitRootProxy);
+    }
+
+    Ok(AclRequestIdentity::Direct)
 }
 
 fn conflicts_with(option: &MountOption) -> Vec<MountOption> {
@@ -130,6 +175,7 @@ fn conflicts_with(option: &MountOption) -> Vec<MountOption> {
         MountOption::FSName(_)
         | MountOption::Subtype(_)
         | MountOption::CUSTOM(_)
+        | MountOption::MacFsKit
         | MountOption::DirSync
         | MountOption::AutoUnmount
         | MountOption::DefaultPermissions => vec![],
@@ -155,6 +201,7 @@ pub(crate) fn option_to_string(option: &MountOption) -> String {
         MountOption::FSName(name) => format!("fsname={name}"),
         MountOption::Subtype(subtype) => format!("subtype={subtype}"),
         MountOption::CUSTOM(value) => value.to_string(),
+        MountOption::MacFsKit => "backend=fskit".to_string(),
         MountOption::AutoUnmount => "auto_unmount".to_string(),
         MountOption::DefaultPermissions => "default_permissions".to_string(),
         MountOption::Dev => "dev".to_string(),
@@ -179,6 +226,7 @@ pub(crate) fn option_group(option: &MountOption) -> MountOptionGroup {
         MountOption::FSName(_) => MountOptionGroup::Fusermount,
         MountOption::Subtype(_) => MountOptionGroup::Fusermount,
         MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
+        MountOption::MacFsKit => MountOptionGroup::KernelOption,
         MountOption::AutoUnmount => MountOptionGroup::Fusermount,
         MountOption::Dev => MountOptionGroup::KernelFlag,
         MountOption::NoDev => MountOptionGroup::KernelFlag,
@@ -292,22 +340,76 @@ mod test {
     use crate::mnt::mount_options::*;
 
     #[test]
-    fn option_checking() {
+    fn option_validation() {
         assert!(
-            check_option_conflicts(&Config {
+            validate_config(&Config {
                 mount_options: vec![MountOption::Suid, MountOption::NoSuid],
                 ..Config::default()
             })
             .is_err()
         );
-        assert!(
-            check_option_conflicts(&Config {
+        assert_eq!(
+            validate_config(&Config {
                 mount_options: vec![MountOption::Suid, MountOption::NoExec],
                 ..Config::default()
             })
-            .is_ok()
+            .unwrap(),
+            AclRequestIdentity::Direct
         );
     }
+
+    #[test]
+    fn mac_fskit_requires_typed_transport_selection() {
+        for value in [
+            "backend=fskit",
+            "backend=fskit,foo",
+            "foo,backend=fskit",
+            "foo,backend=fskit,bar",
+        ] {
+            let error = validate_config(&Config {
+                mount_options: vec![MountOption::CUSTOM(value.to_owned())],
+                ..Config::default()
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        }
+
+        for value in ["xbackend=fskit", "backend=fskitx", "backend=fskit=1"] {
+            assert_eq!(
+                validate_config(&Config {
+                    mount_options: vec![MountOption::CUSTOM(value.to_owned())],
+                    ..Config::default()
+                })
+                .unwrap(),
+                AclRequestIdentity::Direct
+            );
+        }
+
+        let result = validate_config(&Config {
+            mount_options: vec![MountOption::MacFsKit],
+            ..Config::default()
+        });
+        if cfg!(all(target_os = "macos", fuser_mount_impl = "libfuse2")) {
+            assert_eq!(result.unwrap(), AclRequestIdentity::MacFsKitRootProxy);
+        } else {
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn mac_fskit_root_proxy_only_changes_owner_acl_comparison() {
+        let owner = Uid::from_raw(501);
+        let root = Uid::from_raw(0);
+        let other = Uid::from_raw(502);
+
+        assert!(AclRequestIdentity::Direct.matches_owner_acl(owner, owner));
+        assert!(!AclRequestIdentity::Direct.matches_owner_acl(root, owner));
+        assert!(AclRequestIdentity::MacFsKitRootProxy.matches_owner_acl(root, owner));
+        assert!(AclRequestIdentity::MacFsKitRootProxy.matches_owner_acl(owner, owner));
+        assert!(!AclRequestIdentity::MacFsKitRootProxy.matches_owner_acl(other, owner));
+        assert_eq!((root.as_raw(), other.as_raw()), (0, 502));
+    }
+
     #[test]
     fn option_round_trip() {
         use crate::mnt::mount_options::MountOption::*;
@@ -315,6 +417,7 @@ mod test {
             FSName("Blah".to_owned()),
             Subtype("Bloo".to_owned()),
             CUSTOM("bongos".to_owned()),
+            MacFsKit,
             AutoUnmount,
             DefaultPermissions,
             Dev,

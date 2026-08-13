@@ -259,6 +259,20 @@ mod test {
         );
     }
 
+    #[test]
+    fn mac_fskit_mount_argument_is_owner_only() {
+        with_fuse_args(&[MountOption::MacFsKit], SessionACL::Owner, |args| {
+            let values: Vec<_> = (0..args.argc)
+                .map(|index| unsafe {
+                    CStr::from_ptr(*args.argv.offset(index as isize))
+                        .to_str()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(*values, ["rust-fuse", "-o", "backend=fskit"]);
+        });
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn cmd_mount() -> String {
         std::str::from_utf8(

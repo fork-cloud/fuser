@@ -2,6 +2,7 @@
 
 ## Fork delta from 0.18.0
 * Use libfuse2 message channels on macOS, including FSKit providers without a FUSE file descriptor
+* Add typed FSKit backend selection with provider-aware owner ACL checks
 
 ## 0.18.0 - 2026-07-22
 * Remove deprecated feature flags `abi-*`

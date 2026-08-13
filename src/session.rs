@@ -45,8 +45,9 @@ use crate::ll::Version;
 use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi as abi;
 use crate::mnt::Mount;
+use crate::mnt::mount_options::AclRequestIdentity;
 use crate::mnt::mount_options::Config;
-use crate::mnt::mount_options::check_option_conflicts;
+use crate::mnt::mount_options::validate_config;
 use crate::notify::Notifier;
 use crate::read_buf::FuseReadBuf;
 use crate::reply::Reply;
@@ -140,6 +141,8 @@ pub struct Session<FS: Filesystem> {
     pub(crate) allowed: SessionACL,
     /// User that launched the fuser process
     pub(crate) session_owner: Uid,
+    /// How provider credentials are interpreted for owner-only ACL comparison.
+    pub(crate) acl_request_identity: AclRequestIdentity,
     /// FUSE protocol version, as reported by the kernel.
     /// The field is set to `Some` when the init message is received.
     pub(crate) proto_version: Option<Version>,
@@ -162,7 +165,7 @@ impl<FS: Filesystem> Session<FS> {
         mountpoint: P,
         options: &Config,
     ) -> io::Result<Session<FS>> {
-        check_option_conflicts(options)?;
+        let acl_request_identity = validate_config(options)?;
 
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
@@ -188,6 +191,7 @@ impl<FS: Filesystem> Session<FS> {
             },
             allowed: options.acl,
             session_owner: geteuid(),
+            acl_request_identity,
             proto_version: None,
             config: options.clone(),
         };
@@ -206,6 +210,7 @@ impl<FS: Filesystem> Session<FS> {
         acl: SessionACL,
         config: Config,
     ) -> io::Result<Self> {
+        let acl_request_identity = validate_config(&config)?;
         let ch = Channel::from_device(Arc::new(DevFuse(File::from(fd))));
         let mut session = Session {
             filesystem: FilesystemHolder {
@@ -217,6 +222,7 @@ impl<FS: Filesystem> Session<FS> {
             },
             allowed: acl,
             session_owner: geteuid(),
+            acl_request_identity,
             proto_version: None,
             config,
         };
@@ -255,6 +261,7 @@ impl<FS: Filesystem> Session<FS> {
             mount: _do_not_umount_yet,
             allowed,
             session_owner,
+            acl_request_identity,
             proto_version: _,
             config,
         } = self;
@@ -303,6 +310,7 @@ impl<FS: Filesystem> Session<FS> {
                 ch,
                 allowed,
                 session_owner,
+                acl_request_identity,
             };
             threads.push(
                 thread::Builder::new()
@@ -523,6 +531,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) filesystem: Arc<FilesystemHolder<FS>>,
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
+    pub(crate) acl_request_identity: AclRequestIdentity,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
