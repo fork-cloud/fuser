@@ -105,11 +105,11 @@ impl MountImpl {
     fn mount(&mut self, options: &[MountOption], acl: SessionACL) -> io::Result<Channel> {
         match self {
             #[cfg(fuser_mount_impl = "pure-rust")]
-            Self::Pure(mount) => mount.mount(options, acl).map(Channel::from_device),
+            Self::Pure(mount) => mount.mount(options, acl).and_then(Channel::from_device),
             #[cfg(fuser_mount_impl = "libfuse2")]
             Self::Fuse2(mount) => mount.mount(options, acl),
             #[cfg(fuser_mount_impl = "libfuse3")]
-            Self::Fuse3(mount) => mount.mount(options, acl).map(Channel::from_device),
+            Self::Fuse3(mount) => mount.mount(options, acl).and_then(Channel::from_device),
             #[cfg(fuser_mount_impl = "macos-no-mount")]
             _ => {
                 let _ = (options, acl);
@@ -225,7 +225,13 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
         nix::mount::unmount(mnt, nix::mount::MntFlags::empty())
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        nix::mount::umount2(mnt, nix::mount::MntFlags::MNT_DETACH)
+    }
+
     #[cfg(not(any(
+        target_os = "linux",
         target_os = "macos",
         target_os = "freebsd",
         target_os = "dragonfly",

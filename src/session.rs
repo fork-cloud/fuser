@@ -224,7 +224,7 @@ impl<FS: Filesystem> Session<FS> {
         config: Config,
     ) -> io::Result<Self> {
         let acl_request_identity = validate_config(&config)?;
-        let ch = Channel::from_device(Arc::new(DevFuse(File::from(fd))));
+        let ch = Channel::from_device(Arc::new(DevFuse(File::from(fd))))?;
         let mut session = Session {
             filesystem: FilesystemHolder {
                 fs: Some(filesystem),
@@ -926,11 +926,18 @@ impl BackgroundSession {
     /// the same value to resume shutdown.
     pub fn shutdown(&mut self, deadline: Instant) -> BackgroundSessionShutdown {
         let mount = &mut self.mount;
-        self.dispatch
-            .shutdown_with(deadline, || mount.umount_until(deadline))
+        let sender = &self.sender;
+        self.dispatch.shutdown_with(deadline, || {
+            mount.umount_until(deadline)?;
+            sender.interrupt_receive();
+            Ok(())
+        })
     }
 
     /// Returns an object that can be used to send notifications to the kernel.
+    ///
+    /// The notifier does not extend the transport lifetime. Notifications sent
+    /// after the session closes return [`io::ErrorKind::NotConnected`].
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.sender.clone())
     }

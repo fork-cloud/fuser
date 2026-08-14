@@ -83,7 +83,7 @@ impl MountImpl {
                 } else {
                     self.mounted = true;
                     let file = unsafe { File::from_raw_fd(fd) };
-                    Ok(Channel::from_device(Arc::new(DevFuse(file))))
+                    Channel::from_device(Arc::new(DevFuse(file)))
                 }
             }
         })

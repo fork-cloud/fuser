@@ -71,9 +71,9 @@ impl BackingId {
     }
 
     #[cfg(not(all(target_os = "macos", fuser_mount_impl = "libfuse2")))]
-    pub(crate) unsafe fn wrap_raw(channel: &Arc<DevFuse>, id: u32) -> Self {
+    pub(crate) unsafe fn wrap_raw(channel: Weak<DevFuse>, id: u32) -> Self {
         Self {
-            channel: Arc::downgrade(channel),
+            channel,
             backing_id: id,
         }
     }
