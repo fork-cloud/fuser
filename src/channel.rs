@@ -99,10 +99,10 @@ impl DeviceChannel {
         #[cfg(target_os = "linux")]
         {
             set_nonblocking(&device)?;
-            return Ok(Self {
+            Ok(Self {
                 device,
                 interrupt: Arc::new(ReceiveInterrupt::new()?),
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         Ok(Self { device })
